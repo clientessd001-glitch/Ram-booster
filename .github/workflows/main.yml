@@ -972,8 +972,18 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 4. Configurar Android SDK
-        uses: android-actions/setup-android@v3
+      - name: 4. Configurar Android SDK de forma segura
+        run: |
+          mkdir -p $HOME/android-sdk/cmdline-tools/latest
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip
+          mv cmdline-tools/* $HOME/android-sdk/cmdline-tools/latest/
+          rm cmdline-tools.zip
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+          yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
       - name: 5. Instalar Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
