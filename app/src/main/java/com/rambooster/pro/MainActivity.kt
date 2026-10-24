@@ -1,0 +1,842 @@
+package com.rambooster.pro
+
+import android.Manifest
+import android.app.ActivityManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.IBinder
+import android.os.PowerManager
+import android.provider.Settings
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.io.RandomAccessFile
+import kotlin.math.roundToInt
+
+// =========================================================================
+// ESTADO COMPARTILHADO ENTRE A TELA E O SERVIÇO EM 2º PLANO
+// =========================================================================
+object BoosterState {
+    private val _isServiceRunning = MutableStateFlow(false)
+    val isServiceRunning = _isServiceRunning.asStateFlow()
+
+    private val _intervalSeconds = MutableStateFlow(15)
+    val intervalSeconds = _intervalSeconds.asStateFlow()
+
+    private val _remainingSeconds = MutableStateFlow(15)
+    val remainingSeconds = _remainingSeconds.asStateFlow()
+
+    private val _cyclesCount = MutableStateFlow(0)
+    val cyclesCount = _cyclesCount.asStateFlow()
+
+    private val _totalFreedMb = MutableStateFlow(0L)
+    val totalFreedMb = _totalFreedMb.asStateFlow()
+
+    private val _statusMessage = MutableStateFlow("Leitura real do Kernel Linux (/proc/meminfo) ativa.")
+    val statusMessage = _statusMessage.asStateFlow()
+
+    fun setServiceRunning(running: Boolean) {
+        _isServiceRunning.value = running
+    }
+
+    fun updateInterval(seconds: Int) {
+        val safeSec = seconds.coerceIn(3, 600)
+        _intervalSeconds.value = safeSec
+        _remainingSeconds.value = safeSec
+    }
+
+    fun updateRemaining(seconds: Int) {
+        _remainingSeconds.value = seconds
+    }
+
+    fun recordCycle(freedMb: Long, killedApps: Int) {
+        _cyclesCount.value += 1
+        _totalFreedMb.value += freedMb
+        _statusMessage.value =
+            "2º Plano (Ciclo #${_cyclesCount.value}): +$freedMb MB livres ($killedApps apps limpos)."
+    }
+
+    fun setStatus(msg: String) {
+        _statusMessage.value = msg
+    }
+}
+
+// =========================================================================
+// SERVIÇO EM PRIMEIRO PLANO (RODA MESMO COM O APP MINIMIZADO / TELA APAGADA)
+// =========================================================================
+class AutoBoosterService : Service() {
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var timerJob: Job? = null
+
+    companion object {
+        const val CHANNEL_ID = "auto_ram_booster_channel"
+        const val NOTIFICATION_ID = 1001
+        const val ACTION_START = "ACTION_START_BOOSTER"
+        const val ACTION_STOP = "ACTION_STOP_BOOSTER"
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopBoosterService()
+            return START_NOT_STICKY
+        }
+
+        BoosterState.setServiceRunning(true)
+        val initialRam = readRealHardwareRam(this)
+        val notification = buildNotification(
+            ramPercent = ((initialRam.usedActiveMb.toFloat() / initialRam.totalRealMb.toFloat()) * 100).roundToInt(),
+            remainingSec = BoosterState.remainingSeconds.value,
+            cycles = BoosterState.cyclesCount.value,
+            freedMb = BoosterState.totalFreedMb.value
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+
+        startCountdownLoop()
+        return START_STICKY
+    }
+
+    private fun startCountdownLoop() {
+        timerJob?.cancel()
+        timerJob = serviceScope.launch {
+            BoosterState.updateRemaining(BoosterState.intervalSeconds.value)
+
+            while (isActive && BoosterState.isServiceRunning.value) {
+                delay(1000L)
+                val nextSec = BoosterState.remainingSeconds.value - 1
+
+                if (nextSec <= 0) {
+                    BoosterState.setStatus("Auto Booster (2º Plano): Limpando RAM...")
+                    val beforeAvail = readRealHardwareRam(this@AutoBoosterService).availRealMb
+                    val killed = executeRealRamClean(this@AutoBoosterService)
+                    delay(500L)
+                    val afterRam = readRealHardwareRam(this@AutoBoosterService)
+                    val freed = (afterRam.availRealMb - beforeAvail).coerceAtLeast(0L)
+
+                    BoosterState.recordCycle(freed, killed)
+                    BoosterState.updateRemaining(BoosterState.intervalSeconds.value)
+                } else {
+                    BoosterState.updateRemaining(nextSec)
+                }
+
+                // Atualiza a notificação na barra de status a cada segundo
+                val currentRam = readRealHardwareRam(this@AutoBoosterService)
+                val usagePct = ((currentRam.usedActiveMb.toFloat() / currentRam.totalRealMb.toFloat()) * 100).roundToInt()
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.notify(
+                    NOTIFICATION_ID,
+                    buildNotification(
+                        ramPercent = usagePct,
+                        remainingSec = BoosterState.remainingSeconds.value,
+                        cycles = BoosterState.cyclesCount.value,
+                        freedMb = BoosterState.totalFreedMb.value
+                    )
+                )
+            }
+        }
+    }
+
+    private fun stopBoosterService() {
+        BoosterState.setServiceRunning(false)
+        BoosterState.setStatus("Auto Booster em 2º plano desativado.")
+        timerJob?.cancel()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun buildNotification(
+        ramPercent: Int,
+        remainingSec: Int,
+        cycles: Int,
+        freedMb: Long
+    ): Notification {
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val openPendingIntent = PendingIntent.getActivity(
+            this, 0, openAppIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val stopIntent = Intent(this, AutoBoosterService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPendingIntent = PendingIntent.getService(
+            this, 1, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle("Auto RAM Booster Ativo (${remainingSec}s)")
+            .setContentText("RAM: $ramPercent% | Ciclos: $cycles | Liberado: +$freedMb MB")
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setContentIntent(openPendingIntent)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Parar Auto Booster",
+                stopPendingIntent
+            )
+            .build()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Motor Auto RAM Booster",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Mantém o otimizador de RAM ativo em segundo plano"
+                setShowBadge(false)
+            }
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(channel)
+        }
+    }
+
+    override fun onDestroy() {
+        BoosterState.setServiceRunning(false)
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
+
+// =========================================================================
+// ACTIVITY PRINCIPAL E INTERFACE GRÁFICA (JETPACK COMPOSE)
+// =========================================================================
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme(
+                colorScheme = darkColorScheme(
+                    primary = Color(0xFF00E676),
+                    secondary = Color(0xFF2979FF),
+                    background = Color(0xFF0B0F19),
+                    surface = Color(0xFF151C2C)
+                )
+            ) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    RamBoosterApp(context = this)
+                }
+            }
+        }
+    }
+}
+
+data class RealHardwareRam(
+    val commercialGb: Int,
+    val totalRealMb: Long,
+    val usedActiveMb: Long,
+    val availRealMb: Long,
+    val usedWithCacheMb: Long,
+    val cachedAndBuffersMb: Long,
+    val freeRawMb: Long
+)
+
+data class AppProcessItem(
+    val appName: String,
+    val packageName: String
+)
+
+@Composable
+fun RamBoosterApp(context: Context) {
+    val scope = rememberCoroutineScope()
+
+    var ramData by remember { mutableStateOf(readRealHardwareRam(context)) }
+    var showRawCacheAsUsed by remember { mutableStateOf(false) }
+    var isOptimizing by remember { mutableStateOf(false) }
+
+    // Coleta os estados em tempo real do ForegroundService
+    val autoBoosterEnabled by BoosterState.isServiceRunning.collectAsState()
+    val intervalSeconds by BoosterState.intervalSeconds.collectAsState()
+    val remainingSeconds by BoosterState.remainingSeconds.collectAsState()
+    val autoCyclesCount by BoosterState.cyclesCount.collectAsState()
+    val totalFreedAccumulatedMb by BoosterState.totalFreedMb.collectAsState()
+    val statusText by BoosterState.statusMessage.collectAsState()
+
+    var userApps by remember { mutableStateOf<List<AppProcessItem>>(emptyList()) }
+
+    // Permissão de notificação para Android 13+ exibir o painel na barra de status
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        toggleForegroundService(context, true)
+    }
+
+    LaunchedEffect(Unit) {
+        userApps = loadUserInstalledApps(context)
+        while (true) {
+            if (!isOptimizing) {
+                ramData = readRealHardwareRam(context)
+            }
+            delay(1500L)
+        }
+    }
+
+    val displayedUsedMb = if (showRawCacheAsUsed) ramData.usedWithCacheMb else ramData.usedActiveMb
+    val displayedFreeMb = ramData.totalRealMb - displayedUsedMb
+    val usagePercent = if (ramData.totalRealMb > 0) {
+        ((displayedUsedMb.toFloat() / ramData.totalRealMb.toFloat()) * 100f).coerceIn(1f, 99f)
+    } else 0f
+
+    val gaugeColor = when {
+        usagePercent >= 80f -> Color(0xFFFF5252)
+        usagePercent >= 65f -> Color(0xFFFFAB00)
+        else -> Color(0xFF00E676)
+    }
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        // Cabeçalho
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "RAM BOOSTER PRO",
+                        color = Color.White,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Text(
+                        text = "Hardware: ${ramData.commercialGb} GB (${ramData.totalRealMb} MB reais)",
+                        color = Color(0xFF94A3B8),
+                        fontSize = 12.sp
+                    )
+                }
+                Surface(
+                    color = if (autoBoosterEnabled) Color(0xFF00E676).copy(alpha = 0.2f) else Color(0xFF1E293B),
+                    shape = RoundedCornerShape(50)
+                ) {
+                    Text(
+                        text = if (autoBoosterEnabled) "2º PLANO: ${remainingSeconds}s" else "MANUAL",
+                        color = if (autoBoosterEnabled) Color(0xFF00E676) else Color(0xFF94A3B8),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                    )
+                }
+            }
+        }
+
+        // Card de Medição Real
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(
+                            progress = { usagePercent / 100f },
+                            modifier = Modifier.size(150.dp),
+                            strokeWidth = 14.dp,
+                            color = gaugeColor,
+                            trackColor = Color(0xFF0B0F19)
+                        )
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = "${usagePercent.roundToInt()}%",
+                                color = Color.White,
+                                fontSize = 34.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                            Text(
+                                text = "$displayedUsedMb / ${ramData.totalRealMb} MB",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        RamMetricBox("Usada Ativa", "${ramData.usedActiveMb} MB", Color(0xFF38BDF8))
+                        RamMetricBox("Em Cache", "${ramData.cachedAndBuffersMb} MB", Color(0xFFFBBF24))
+                        RamMetricBox("Livre Real", "$displayedFreeMb MB", Color(0xFF00E676))
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0xFF0B0F19))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = if (showRawCacheAsUsed) "Modo: Somar Cache como Usado" else "Modo: Padrão do Sistema Android",
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = if (showRawCacheAsUsed) "Igual a outros apps de limpeza" else "Igual às Configurações do celular",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 10.sp
+                            )
+                        }
+                        Switch(
+                            checked = showRawCacheAsUsed,
+                            onCheckedChange = { showRawCacheAsUsed = it }
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    Text(
+                        text = statusText,
+                        color = Color(0xFFCBD5E1),
+                        fontSize = 12.sp
+                    )
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                isOptimizing = true
+                                BoosterState.setStatus("Limpando processos em segundo plano...")
+                                val beforeAvail = readRealHardwareRam(context).availRealMb
+                                val killed = executeRealRamClean(context)
+                                delay(700L)
+                                ramData = readRealHardwareRam(context)
+                                val freed = (ramData.availRealMb - beforeAvail).coerceAtLeast(0L)
+                                BoosterState.recordCycle(freed, killed)
+                                isOptimizing = false
+                            }
+                        },
+                        enabled = !isOptimizing,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E676)),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp)
+                    ) {
+                        Text(
+                            text = if (isOptimizing) "OTIMIZANDO MEMÓRIA..." else "DEIXAR MAIS RÁPIDO AGORA",
+                            color = Color(0xFF052E16),
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+                }
+            }
+        }
+
+        // Card do Auto RAM Booster em 2º Plano (ForegroundService)
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(18.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Auto Booster em 2º Plano",
+                                color = Color.White,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Continua limpando com o app minimizado ou tela apagada",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 11.sp
+                            )
+                        }
+                        Switch(
+                            checked = autoBoosterEnabled,
+                            onCheckedChange = { enable ->
+                                if (enable) {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                    } else {
+                                        toggleForegroundService(context, true)
+                                    }
+                                } else {
+                                    toggleForegroundService(context, false)
+                                }
+                            }
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    val presets = listOf(5, 10, 15, 30, 60)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        presets.forEach { sec ->
+                            val selected = intervalSeconds == sec
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (selected) Color(0xFF00E676) else Color(0xFF0B0F19))
+                                    .clickable { BoosterState.updateInterval(sec) }
+                                    .padding(vertical = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "${sec}s",
+                                    color = if (selected) Color(0xFF052E16) else Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedButton(onClick = { BoosterState.updateInterval(intervalSeconds - 5) }) {
+                            Text("- 5s", color = Color.White)
+                        }
+
+                        Text(
+                            text = "Intervalo: $intervalSeconds segundos",
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+
+                        OutlinedButton(onClick = { BoosterState.updateInterval(intervalSeconds + 5) }) {
+                            Text("+ 5s", color = Color.White)
+                        }
+                    }
+
+                    if (autoBoosterEnabled) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        LinearProgressIndicator(
+                            progress = { remainingSeconds.toFloat() / intervalSeconds.toFloat() },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(8.dp)
+                                .clip(RoundedCornerShape(4.dp)),
+                            color = Color(0xFF00E676),
+                            trackColor = Color(0xFF0B0F19)
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "Rodando em 2º plano: ${remainingSeconds}s",
+                                color = Color(0xFF00E676),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Ciclos: $autoCyclesCount | Total: +$totalFreedAccumulatedMb MB",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Botão para impedir que o sistema mate o serviço com a tela desligada
+                    OutlinedButton(
+                        onClick = { requestIgnoreBatteryOptimizations(context) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "Manter Ativo Sem Restrição de Bateria",
+                            color = Color(0xFF38BDF8),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+        }
+
+        // Lista de Apps para Forçar Parada
+        item {
+            Text(
+                text = "Apps Instalados (${userApps.size}) - Toque para Forçar Parada",
+                color = Color.White,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
+
+        items(userApps) { app ->
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = app.appName,
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = app.packageName,
+                            color = Color(0xFF64748B),
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Button(
+                        onClick = { openAppSettingsToForceStop(context, app.packageName) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text("Forçar Parada", color = Color.White, fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun RamMetricBox(label: String, value: String, color: Color) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(text = label, color = Color(0xFF94A3B8), fontSize = 11.sp)
+        Text(text = value, color = color, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+// Inicia ou encerra o ForegroundService
+fun toggleForegroundService(context: Context, start: Boolean) {
+    val intent = Intent(context, AutoBoosterService::class.java).apply {
+        action = if (start) AutoBoosterService.ACTION_START else AutoBoosterService.ACTION_STOP
+    }
+    if (start) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    } else {
+        context.startService(intent)
+    }
+}
+
+// Solicita ao Android que não pause o serviço quando a tela estiver bloqueada
+fun requestIgnoreBatteryOptimizations(context: Context) {
+    try {
+        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!pm.isIgnoringBatteryOptimizations(context.packageName)) {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:${context.packageName}")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } else {
+            BoosterState.setStatus("App já está liberado da economia de bateria!")
+        }
+    } catch (_: Exception) {
+    }
+}
+
+fun readRealHardwareRam(context: Context): RealHardwareRam {
+    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    val memInfo = ActivityManager.MemoryInfo()
+    am.getMemoryInfo(memInfo)
+
+    var memFreeKb = 0L
+    var buffersKb = 0L
+    var cachedKb = 0L
+
+    try {
+        val reader = RandomAccessFile("/proc/meminfo", "r")
+        var line: String?
+        while (reader.readLine().also { line = it } != null) {
+            val parts = line!!.trim().split("\\s+".toRegex())
+            if (parts.size >= 2) {
+                val value = parts[1].toLongOrNull() ?: 0L
+                when (parts[0]) {
+                    "MemFree:" -> memFreeKb = value
+                    "Buffers:" -> buffersKb = value
+                    "Cached:" -> cachedKb = value
+                }
+            }
+        }
+        reader.close()
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+
+    val totalRealMb = memInfo.totalMem / (1024 * 1024)
+    val availRealMb = memInfo.availMem / (1024 * 1024)
+    val usedActiveMb = totalRealMb - availRealMb
+
+    val freeRawMb = if (memFreeKb > 0) memFreeKb / 1024 else availRealMb / 2
+    val cachedMb = if (cachedKb + buffersKb > 0) (cachedKb + buffersKb) / 1024 else (availRealMb - freeRawMb).coerceAtLeast(0L)
+    val usedWithCacheMb = (totalRealMb - freeRawMb).coerceIn(usedActiveMb, totalRealMb)
+
+    val commercialGb = when {
+        totalRealMb > 12500 -> 16
+        totalRealMb > 8500 -> 12
+        totalRealMb > 6200 -> 8
+        totalRealMb > 4200 -> 6
+        totalRealMb > 2200 -> 4
+        else -> 2
+    }
+
+    return RealHardwareRam(
+        commercialGb = commercialGb,
+        totalRealMb = totalRealMb,
+        usedActiveMb = usedActiveMb,
+        availRealMb = availRealMb,
+        usedWithCacheMb = usedWithCacheMb,
+        cachedAndBuffersMb = cachedMb,
+        freeRawMb = freeRawMb
+    )
+}
+
+suspend fun executeRealRamClean(context: Context): Int = withContext(Dispatchers.IO) {
+    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    val pm = context.packageManager
+    val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+    var count = 0
+
+    for (app in packages) {
+        val isSystem = (app.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+        if (!isSystem && app.packageName != context.packageName) {
+            try {
+                am.killBackgroundProcesses(app.packageName)
+                count++
+            } catch (_: Exception) {
+            }
+        }
+    }
+    System.gc()
+    return@withContext count
+}
+
+suspend fun loadUserInstalledApps(context: Context): List<AppProcessItem> = withContext(Dispatchers.IO) {
+    val pm = context.packageManager
+    val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+    val result = mutableListOf<AppProcessItem>()
+
+    for (app in apps) {
+        val isSystem = (app.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+        if (!isSystem && app.packageName != context.packageName) {
+            val label = pm.getApplicationLabel(app).toString()
+            result.add(AppProcessItem(label, app.packageName))
+        }
+    }
+    return@withContext result.sortedBy { it.appName.lowercase() }
+}
+
+fun openAppSettingsToForceStop(context: Context, packageName: String) {
+    try {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.fromParts("package", packageName, null)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+    }
+}
