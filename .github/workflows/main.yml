@@ -1,4 +1,4 @@
-name: Gerar APK RAM Booster Pro
+name: Gerar APK RAM Booster Pro v4 RAM Calc
 
 on:
   push:
@@ -19,7 +19,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 3. Configurar Android SDK e Ferramentas
+      - name: 3. Configurar Android SDK Oficial
         run: |
           export ANDROID_SDK_ROOT=$HOME/android-sdk
           mkdir -p $ANDROID_SDK_ROOT/cmdline-tools/latest
@@ -38,9 +38,11 @@ jobs:
           yes | sdkmanager --licenses || true
           sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: 4. Criar toda a estrutura do projeto Kotlin
+      - name: 4. Criar estrutura do projeto Kotlin v4.0
         run: |
           mkdir -p app/src/main/java/com/rambooster/pro
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
 
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
@@ -89,8 +91,8 @@ jobs:
                   applicationId = "com.rambooster.pro"
                   minSdk = 24
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "2.0-PRO"
+                  versionCode = 5
+                  versionName = "4.0-RAM-CALC"
               }
 
               buildTypes {
@@ -128,21 +130,44 @@ jobs:
           }
           EOF
 
+          cat << 'EOF' > app/src/main/res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">RAM Booster Calc</string>
+              <string name="accessibility_desc">Automatiza a hibernação de aplicativos pesados em segundo plano.</string>
+          </resources>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/accessibility_service_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews|flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/accessibility_desc"
+              android:notificationTimeout="80" />
+          EOF
+
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
               <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.CLEAR_APP_CACHE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              
+              <!-- Permissão exclusiva para a Bolha Flutuante estilo RAM Calc -->
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
               <application
                   android:allowBackup="true"
                   android:icon="@android:drawable/sym_def_app_icon"
-                  android:label="RAM Booster Pro"
+                  android:label="@string/app_name"
                   android:supportsRtl="true"
                   android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
@@ -156,11 +181,31 @@ jobs:
                       </intent-filter>
                   </activity>
 
+                  <!-- Serviço da Bolha Flutuante sobre Jogos -->
+                  <service
+                      android:name=".FloatingCalcService"
+                      android:enabled="true"
+                      android:exported="false" />
+
                   <service
                       android:name=".AutoBoosterService"
                       android:enabled="true"
                       android:exported="false"
                       android:foregroundServiceType="dataSync" />
+
+                  <service
+                      android:name=".HibernatorAccessibilityService"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:label="RAM Booster - Motor Hibernador"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
 
               </application>
           </manifest>
@@ -170,14 +215,17 @@ jobs:
           package com.rambooster.pro
 
           import android.Manifest
+          import android.accessibilityservice.AccessibilityService
           import android.app.ActivityManager
           import android.app.Notification
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.PendingIntent
           import android.app.Service
+          import android.content.BroadcastReceiver
           import android.content.Context
           import android.content.Intent
+          import android.content.IntentFilter
           import android.content.pm.ApplicationInfo
           import android.content.pm.PackageManager
           import android.content.pm.ServiceInfo
@@ -187,6 +235,9 @@ jobs:
           import android.os.IBinder
           import android.os.PowerManager
           import android.provider.Settings
+          import android.text.TextUtils
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.compose.setContent
@@ -213,15 +264,154 @@ jobs:
           import kotlinx.coroutines.flow.asStateFlow
           import java.io.RandomAccessFile
           import kotlin.math.roundToInt
+          
+          import android.graphics.Color as ViewColor
+          import android.graphics.PixelFormat
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.TextView
+          import android.widget.LinearLayout
+          import android.graphics.drawable.GradientDrawable
+
+          // =========================================================================
+          // SERVIÇO DE BOLHA FLUTUANTE (ESTILO RAM CALC) - ZERO USO DE CPU
+          // =========================================================================
+          class FloatingCalcService : Service() {
+              private var windowManager: WindowManager? = null
+              private var floatingView: LinearLayout? = null
+              private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
+              private var updateJob: Job? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+                  
+                  // Cria o visual da Bolha Oval Flutuante (Nativo = 0 Lag)
+                  floatingView = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      val shape = GradientDrawable()
+                      shape.shape = GradientDrawable.OVAL
+                      shape.setColor(ViewColor.parseColor("#E6090D16")) // Preto translúcido
+                      shape.setStroke(6, ViewColor.parseColor("#00E676")) // Borda Verde neon
+                      background = shape
+                      
+                      val padding = (resources.displayMetrics.density * 20).toInt()
+                      setPadding(padding, padding, padding, padding)
+                      elevation = 10f
+                  }
+                  
+                  val ramText = TextView(this).apply {
+                      text = "RAM"
+                      setTextColor(ViewColor.parseColor("#00E676"))
+                      textSize = 14f
+                      setTypeface(null, android.graphics.Typeface.BOLD)
+                      gravity = Gravity.CENTER
+                  }
+                  floatingView?.addView(ramText)
+
+                  val params = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) 
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY 
+                      else WindowManager.LayoutParams.TYPE_PHONE,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  params.gravity = Gravity.TOP or Gravity.START
+                  params.x = 20
+                  params.y = 200
+
+                  var initialX = 0
+                  var initialY = 0
+                  var initialTouchX = 0f
+                  var initialTouchY = 0f
+                  var isMoved = false
+
+                  floatingView?.setOnTouchListener { _, event ->
+                      when (event.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              initialX = params.x
+                              initialY = params.y
+                              initialTouchX = event.rawX
+                              initialTouchY = event.rawY
+                              isMoved = false
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (event.rawX - initialTouchX).toInt()
+                              val dy = (event.rawY - initialTouchY).toInt()
+                              if (Math.abs(dx) > 10 || Math.abs(dy) > 10) isMoved = true
+                              params.x = initialX + dx
+                              params.y = initialY + dy
+                              windowManager?.updateViewLayout(floatingView, params)
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (!isMoved) {
+                                  // Click! Otimiza por cima de tudo
+                                  ramText.text = "Limpando.."
+                                  ramText.setTextColor(ViewColor.parseColor("#38BDF8"))
+                                  serviceScope.launch(Dispatchers.IO) {
+                                      val before = readRealHardwareRam(this@FloatingCalcService).availRealMb
+                                      executeDeepRamClean(this@FloatingCalcService)
+                                      delay(400)
+                                      val after = readRealHardwareRam(this@FloatingCalcService).availRealMb
+                                      val freed = (after - before).coerceAtLeast(0)
+                                      withContext(Dispatchers.Main) {
+                                          ramText.text = "+$freed MB"
+                                          ramText.setTextColor(ViewColor.parseColor("#FBBF24"))
+                                          delay(2000)
+                                          updateRamText(ramText)
+                                      }
+                                  }
+                              }
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+                  windowManager?.addView(floatingView, params)
+                  startRamMonitor(ramText)
+              }
+
+              private fun startRamMonitor(textView: TextView) {
+                  updateJob?.cancel()
+                  updateJob = serviceScope.launch {
+                      while (isActive) {
+                          updateRamText(textView)
+                          delay(3500)
+                      }
+                  }
+              }
+
+              private fun updateRamText(textView: TextView) {
+                  val ram = readRealHardwareRam(this@FloatingCalcService)
+                  val percent = if (ram.totalRealMb > 0) ((ram.usedActiveMb.toFloat() / ram.totalRealMb.toFloat()) * 100).toInt() else 0
+                  textView.text = "$percent%\nRAM"
+                  textView.setTextColor(if (percent > 85) ViewColor.parseColor("#EF4444") else ViewColor.parseColor("#00E676"))
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  serviceScope.cancel()
+                  floatingView?.let { windowManager?.removeView(it) }
+              }
+          }
 
           object BoosterState {
               private val _isServiceRunning = MutableStateFlow(false)
               val isServiceRunning = _isServiceRunning.asStateFlow()
 
-              private val _intervalSeconds = MutableStateFlow(15)
+              private val _intervalSeconds = MutableStateFlow(30)
               val intervalSeconds = _intervalSeconds.asStateFlow()
 
-              private val _remainingSeconds = MutableStateFlow(15)
+              private val _remainingSeconds = MutableStateFlow(30)
               val remainingSeconds = _remainingSeconds.asStateFlow()
 
               private val _cyclesCount = MutableStateFlow(0)
@@ -230,42 +420,124 @@ jobs:
               private val _totalFreedMb = MutableStateFlow(0L)
               val totalFreedMb = _totalFreedMb.asStateFlow()
 
-              private val _statusMessage = MutableStateFlow("Leitura real do Kernel Linux (/proc/meminfo) ativa.")
+              private val _statusMessage = MutableStateFlow("Motor RAM Calc v4 pronto.")
               val statusMessage = _statusMessage.asStateFlow()
 
-              fun setServiceRunning(running: Boolean) {
-                  _isServiceRunning.value = running
-              }
+              private val _isHibernating = MutableStateFlow(false)
+              val isHibernating = _isHibernating.asStateFlow()
+
+              private val _autoForceStopOnTimer = MutableStateFlow(false)
+              val autoForceStopOnTimer = _autoForceStopOnTimer.asStateFlow()
+
+              private val _autoCleanOnScreenOff = MutableStateFlow(true)
+              val autoCleanOnScreenOff = _autoCleanOnScreenOff.asStateFlow()
+
+              private val _selectedPackages = MutableStateFlow<Set<String>>(emptySet())
+              val selectedPackages = _selectedPackages.asStateFlow()
+
+              @Volatile
+              var stepCompletedForCurrentApp: Boolean = false
+              @Volatile
+              var clickedForceStopWaitingDialog: Boolean = false
+
+              fun setServiceRunning(running: Boolean) { _isServiceRunning.value = running }
+              fun setHibernating(active: Boolean) { _isHibernating.value = active }
+              fun setAutoForceStopOnTimer(enabled: Boolean) { _autoForceStopOnTimer.value = enabled }
+              fun setAutoCleanOnScreenOff(enabled: Boolean) { _autoCleanOnScreenOff.value = enabled }
+              fun setSelectedPackages(pkgs: Set<String>) { _selectedPackages.value = pkgs }
 
               fun updateInterval(seconds: Int) {
-                  val safeSec = seconds.coerceIn(3, 600)
+                  val safeSec = seconds.coerceIn(5, 600)
                   _intervalSeconds.value = safeSec
                   _remainingSeconds.value = safeSec
               }
-
-              fun updateRemaining(seconds: Int) {
-                  _remainingSeconds.value = seconds
-              }
-
+              fun updateRemaining(seconds: Int) { _remainingSeconds.value = seconds }
               fun recordCycle(freedMb: Long, killedApps: Int) {
                   _cyclesCount.value += 1
                   _totalFreedMb.value += freedMb
-                  _statusMessage.value =
-                      "2º Plano (Ciclo #${_cyclesCount.value}): +$freedMb MB livres ($killedApps apps limpos)."
+                  _statusMessage.value = "Auto Ciclo #${_cyclesCount.value}: +$freedMb MB livres ($killedApps pacotes)."
               }
+              fun setStatus(msg: String) { _statusMessage.value = msg }
+          }
 
-              fun setStatus(msg: String) {
-                  _statusMessage.value = msg
+          class HibernatorAccessibilityService : AccessibilityService() {
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (!BoosterState.isHibernating.value) return
+                  val rootNode = rootInActiveWindow ?: return
+                  try {
+                      val cancelButtons = findNodesByKeywords(rootNode, listOf("cancelar", "cancel"))
+                      if (cancelButtons.isNotEmpty() || BoosterState.clickedForceStopWaitingDialog) {
+                          val confirmNodes = findNodesByKeywords(rootNode, listOf("ok", "forçar parada", "forçar interrupção", "force stop", "sim", "encerrar"))
+                          val okById = rootNode.findAccessibilityNodeInfosByViewId("android:id/button1")
+                          for (node in (okById + confirmNodes).distinct()) {
+                              if (clickNodeOrParent(node)) {
+                                  BoosterState.clickedForceStopWaitingDialog = false
+                                  BoosterState.stepCompletedForCurrentApp = true
+                                  performGlobalAction(GLOBAL_ACTION_BACK)
+                                  return
+                              }
+                          }
+                      }
+                      val forceStopNodes = findNodesByKeywords(rootNode, listOf("forçar parada", "forçar interrupção", "force stop", "forçar fechamento", "encerrar"))
+                      val byIdRight = rootNode.findAccessibilityNodeInfosByViewId("com.android.settings:id/right_button")
+                      val byIdForce = rootNode.findAccessibilityNodeInfosByViewId("com.android.settings:id/force_stop_button")
+                      for (node in (forceStopNodes + byIdRight + byIdForce).distinct()) {
+                          if (!node.isEnabled) {
+                              BoosterState.stepCompletedForCurrentApp = true
+                              performGlobalAction(GLOBAL_ACTION_BACK)
+                              return
+                          }
+                          if (clickNodeOrParent(node)) {
+                              BoosterState.clickedForceStopWaitingDialog = true
+                              return
+                          }
+                      }
+                  } catch (_: Exception) {}
               }
+              private fun findNodesByKeywords(root: AccessibilityNodeInfo, keywords: List<String>): List<AccessibilityNodeInfo> {
+                  val results = mutableListOf<AccessibilityNodeInfo>()
+                  for (kw in keywords) {
+                      root.findAccessibilityNodeInfosByText(kw)?.forEach { item ->
+                          val text = item.text?.toString()?.lowercase()?.trim() ?: ""
+                          val desc = item.contentDescription?.toString()?.lowercase()?.trim() ?: ""
+                          if (text == kw || desc == kw || text.contains(kw)) results.add(item)
+                      }
+                  }
+                  return results
+              }
+              private fun clickNodeOrParent(node: AccessibilityNodeInfo?): Boolean {
+                  var current = node
+                  var depth = 0
+                  while (current != null && depth < 5) {
+                      if (current.isClickable && current.isEnabled) return current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                      current = current.parent
+                      depth++
+                  }
+                  return false
+              }
+              override fun onInterrupt() {}
           }
 
           class AutoBoosterService : Service() {
               private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
               private var timerJob: Job? = null
+              private val screenOffReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      if (intent?.action == Intent.ACTION_SCREEN_OFF && BoosterState.autoCleanOnScreenOff.value) {
+                          serviceScope.launch {
+                              val beforeAvail = readRealHardwareRam(this@AutoBoosterService).availRealMb
+                              val killed = executeDeepRamClean(this@AutoBoosterService)
+                              delay(400L)
+                              val afterRam = readRealHardwareRam(this@AutoBoosterService)
+                              BoosterState.recordCycle((afterRam.availRealMb - beforeAvail).coerceAtLeast(0L), killed)
+                          }
+                      }
+                  }
+              }
 
               companion object {
-                  const val CHANNEL_ID = "auto_ram_booster_channel"
-                  const val NOTIFICATION_ID = 1001
+                  const val CHANNEL_ID = "auto_ram_booster_v4_channel"
+                  const val NOTIFICATION_ID = 1006
                   const val ACTION_START = "ACTION_START_BOOSTER"
                   const val ACTION_STOP = "ACTION_STOP_BOOSTER"
               }
@@ -273,6 +545,7 @@ jobs:
               override fun onCreate() {
                   super.onCreate()
                   createNotificationChannel()
+                  registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
               }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -280,135 +553,81 @@ jobs:
                       stopBoosterService()
                       return START_NOT_STICKY
                   }
-
                   BoosterState.setServiceRunning(true)
-                  val initialRam = readRealHardwareRam(this)
-                  val notification = buildNotification(
-                      ramPercent = ((initialRam.usedActiveMb.toFloat() / initialRam.totalRealMb.toFloat()) * 100).roundToInt(),
-                      remainingSec = BoosterState.remainingSeconds.value,
-                      cycles = BoosterState.cyclesCount.value,
-                      freedMb = BoosterState.totalFreedMb.value
-                  )
-
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                      startForeground(
-                          NOTIFICATION_ID,
-                          notification,
-                          ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                      )
-                  } else {
-                      startForeground(NOTIFICATION_ID, notification)
-                  }
-
-                  startCountdownLoop()
+                  val ram = readRealHardwareRam(this)
+                  val notif = buildNotification(((ram.usedActiveMb.toFloat() / ram.totalRealMb.toFloat()) * 100).roundToInt(), BoosterState.intervalSeconds.value, BoosterState.cyclesCount.value, BoosterState.totalFreedMb.value)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) startForeground(NOTIFICATION_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) else startForeground(NOTIFICATION_ID, notif)
+                  startAutoLoop()
                   return START_STICKY
               }
 
-              private fun startCountdownLoop() {
+              private fun startAutoLoop() {
                   timerJob?.cancel()
                   timerJob = serviceScope.launch {
                       BoosterState.updateRemaining(BoosterState.intervalSeconds.value)
-
                       while (isActive && BoosterState.isServiceRunning.value) {
                           delay(1000L)
+                          if (BoosterState.isHibernating.value) continue
                           val nextSec = BoosterState.remainingSeconds.value - 1
-
                           if (nextSec <= 0) {
-                              BoosterState.setStatus("Auto Booster (2º Plano): Limpando RAM...")
-                              val beforeAvail = readRealHardwareRam(this@AutoBoosterService).availRealMb
-                              val killed = executeRealRamClean(this@AutoBoosterService)
-                              delay(500L)
-                              val afterRam = readRealHardwareRam(this@AutoBoosterService)
-                              val freed = (afterRam.availRealMb - beforeAvail).coerceAtLeast(0L)
-
-                              BoosterState.recordCycle(freed, killed)
+                              val pkgs = BoosterState.selectedPackages.value.toList()
+                              if (BoosterState.autoForceStopOnTimer.value && isAccessibilityServiceEnabled(this@AutoBoosterService) && pkgs.isNotEmpty()) {
+                                  runAutomatedHibernation(this@AutoBoosterService, pkgs, returnToApp = false)
+                              } else {
+                                  val beforeAvail = readRealHardwareRam(this@AutoBoosterService).availRealMb
+                                  val killed = executeDeepRamClean(this@AutoBoosterService)
+                                  delay(400L)
+                                  val afterRam = readRealHardwareRam(this@AutoBoosterService)
+                                  BoosterState.recordCycle((afterRam.availRealMb - beforeAvail).coerceAtLeast(0L), killed)
+                              }
                               BoosterState.updateRemaining(BoosterState.intervalSeconds.value)
+                              val ram = readRealHardwareRam(this@AutoBoosterService)
+                              val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                              nm.notify(NOTIFICATION_ID, buildNotification(((ram.usedActiveMb.toFloat() / ram.totalRealMb.toFloat()) * 100).roundToInt(), BoosterState.intervalSeconds.value, BoosterState.cyclesCount.value, BoosterState.totalFreedMb.value))
                           } else {
                               BoosterState.updateRemaining(nextSec)
                           }
-
-                          val currentRam = readRealHardwareRam(this@AutoBoosterService)
-                          val usagePct = ((currentRam.usedActiveMb.toFloat() / currentRam.totalRealMb.toFloat()) * 100).roundToInt()
-                          val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                          nm.notify(
-                              NOTIFICATION_ID,
-                              buildNotification(
-                                  ramPercent = usagePct,
-                                  remainingSec = BoosterState.remainingSeconds.value,
-                                  cycles = BoosterState.cyclesCount.value,
-                                  freedMb = BoosterState.totalFreedMb.value
-                              )
-                          )
                       }
                   }
               }
 
               private fun stopBoosterService() {
                   BoosterState.setServiceRunning(false)
-                  BoosterState.setStatus("Auto Booster em 2º plano desativado.")
+                  BoosterState.setStatus("Auto Booster desativado.")
                   timerJob?.cancel()
                   stopForeground(STOP_FOREGROUND_REMOVE)
                   stopSelf()
               }
 
-              private fun buildNotification(
-                  ramPercent: Int,
-                  remainingSec: Int,
-                  cycles: Int,
-                  freedMb: Long
-              ): Notification {
-                  val openAppIntent = Intent(this, MainActivity::class.java).apply {
-                      flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-                  }
-                  val openPendingIntent = PendingIntent.getActivity(
-                      this, 0, openAppIntent,
-                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                  )
-
-                  val stopIntent = Intent(this, AutoBoosterService::class.java).apply {
-                      action = ACTION_STOP
-                  }
-                  val stopPendingIntent = PendingIntent.getService(
-                      this, 1, stopIntent,
-                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                  )
-
+              private fun buildNotification(ramPercent: Int, intervalSec: Int, cycles: Int, freedMb: Long): Notification {
+                  val intent = Intent(this, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_SINGLE_TOP }
+                  val pIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                  val stopIntent = Intent(this, AutoBoosterService::class.java).apply { action = ACTION_STOP }
+                  val pStop = PendingIntent.getService(this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
                   return NotificationCompat.Builder(this, CHANNEL_ID)
                       .setSmallIcon(android.R.drawable.stat_notify_sync)
-                      .setContentTitle("Auto RAM Booster Ativo (${remainingSec}s)")
-                      .setContentText("RAM: $ramPercent% | Ciclos: $cycles | Liberado: +$freedMb MB")
+                      .setContentTitle("RAM Booster Turbo (${intervalSec}s)")
+                      .setContentText("RAM: $ramPercent% | Total Liberado: +$freedMb MB")
                       .setOnlyAlertOnce(true)
                       .setOngoing(true)
-                      .setContentIntent(openPendingIntent)
-                      .addAction(
-                          android.R.drawable.ic_menu_close_clear_cancel,
-                          "Parar Auto Booster",
-                          stopPendingIntent
-                      )
+                      .setContentIntent(pIntent)
+                      .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Desligar", pStop)
                       .build()
               }
 
               private fun createNotificationChannel() {
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val channel = NotificationChannel(
-                          CHANNEL_ID,
-                          "Motor Auto RAM Booster",
-                          NotificationManager.IMPORTANCE_LOW
-                      ).apply {
-                          description = "Mantém o otimizador de RAM ativo em segundo plano"
-                          setShowBadge(false)
-                      }
                       val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                      nm.createNotificationChannel(channel)
+                      nm.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Serviço Auto Booster", NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
                   }
               }
 
               override fun onDestroy() {
+                  try { unregisterReceiver(screenOffReceiver) } catch (_: Exception) {}
                   BoosterState.setServiceRunning(false)
                   serviceScope.cancel()
                   super.onDestroy()
               }
-
               override fun onBind(intent: Intent?): IBinder? = null
           }
 
@@ -416,47 +635,24 @@ jobs:
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   setContent {
-                      MaterialTheme(
-                          colorScheme = darkColorScheme(
-                              primary = Color(0xFF00E676),
-                              secondary = Color(0xFF2979FF),
-                              background = Color(0xFF0B0F19),
-                              surface = Color(0xFF151C2C)
-                          )
-                      ) {
-                          Surface(
-                              modifier = Modifier.fillMaxSize(),
-                              color = MaterialTheme.colorScheme.background
-                          ) {
-                              RamBoosterApp(context = this)
+                      MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFF00E676), secondary = Color(0xFF38BDF8), background = Color(0xFF090D16), surface = Color(0xFF131B2E))) {
+                          Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                              RamBoosterTurboScreen(context = this)
                           }
                       }
                   }
               }
           }
 
-          data class RealHardwareRam(
-              val commercialGb: Int,
-              val totalRealMb: Long,
-              val usedActiveMb: Long,
-              val availRealMb: Long,
-              val usedWithCacheMb: Long,
-              val cachedAndBuffersMb: Long,
-              val freeRawMb: Long
-          )
-
-          data class AppProcessItem(
-              val appName: String,
-              val packageName: String
-          )
+          data class RealHardwareRam(val commercialGb: Int, val totalRealMb: Long, val usedActiveMb: Long, val availRealMb: Long, val usedWithCacheMb: Long, val cachedAndBuffersMb: Long, val freeRawMb: Long)
+          data class AppProcessItem(val appName: String, val packageName: String, val isRunningOrHeavy: Boolean)
 
           @Composable
-          fun RamBoosterApp(context: Context) {
+          fun RamBoosterTurboScreen(context: Context) {
               val scope = rememberCoroutineScope()
-
               var ramData by remember { mutableStateOf(readRealHardwareRam(context)) }
-              var showRawCacheAsUsed by remember { mutableStateOf(false) }
               var isOptimizing by remember { mutableStateOf(false) }
+              var isAccessibilityOn by remember { mutableStateOf(isAccessibilityServiceEnabled(context)) }
 
               val autoBoosterEnabled by BoosterState.isServiceRunning.collectAsState()
               val intervalSeconds by BoosterState.intervalSeconds.collectAsState()
@@ -464,384 +660,134 @@ jobs:
               val autoCyclesCount by BoosterState.cyclesCount.collectAsState()
               val totalFreedAccumulatedMb by BoosterState.totalFreedMb.collectAsState()
               val statusText by BoosterState.statusMessage.collectAsState()
+              val isHibernating by BoosterState.isHibernating.collectAsState()
+              val selectedPackages by BoosterState.selectedPackages.collectAsState()
 
               var userApps by remember { mutableStateOf<List<AppProcessItem>>(emptyList()) }
-
-              val notificationPermissionLauncher = rememberLauncherForActivityResult(
-                  contract = ActivityResultContracts.RequestPermission()
-              ) { _ ->
-                  toggleForegroundService(context, true)
-              }
+              val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { _ -> toggleForegroundService(context, true) }
 
               LaunchedEffect(Unit) {
-                  userApps = loadUserInstalledApps(context)
+                  val loaded = loadUserInstalledApps(context)
+                  userApps = loaded
+                  if (selectedPackages.isEmpty()) BoosterState.setSelectedPackages(loaded.take(6).map { it.packageName }.toSet())
                   while (true) {
-                      if (!isOptimizing) {
+                      if (!isOptimizing && !isHibernating) {
                           ramData = readRealHardwareRam(context)
+                          isAccessibilityOn = isAccessibilityServiceEnabled(context)
                       }
-                      delay(1500L)
+                      delay(2000L)
                   }
               }
 
-              val displayedUsedMb = if (showRawCacheAsUsed) ramData.usedWithCacheMb else ramData.usedActiveMb
-              val displayedFreeMb = ramData.totalRealMb - displayedUsedMb
-              val usagePercent = if (ramData.totalRealMb > 0) {
-                  ((displayedUsedMb.toFloat() / ramData.totalRealMb.toFloat()) * 100f).coerceIn(1f, 99f)
-              } else 0f
+              val usagePercent = if (ramData.totalRealMb > 0) ((ramData.usedActiveMb.toFloat() / ramData.totalRealMb.toFloat()) * 100f).coerceIn(1f, 99f) else 0f
+              val gaugeColor = when { usagePercent >= 80f -> Color(0xFFFF5252); usagePercent >= 65f -> Color(0xFFFFAB00); else -> Color(0xFF00E676) }
 
-              val gaugeColor = when {
-                  usagePercent >= 80f -> Color(0xFFFF5252)
-                  usagePercent >= 65f -> Color(0xFFFFAB00)
-                  else -> Color(0xFF00E676)
-              }
-
-              LazyColumn(
-                  modifier = Modifier
-                      .fillMaxSize()
-                      .padding(16.dp),
-                  verticalArrangement = Arrangement.spacedBy(14.dp)
-              ) {
+              LazyColumn(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                   item {
-                      Row(
-                          modifier = Modifier.fillMaxWidth(),
-                          horizontalArrangement = Arrangement.SpaceBetween,
-                          verticalAlignment = Alignment.CenterVertically
-                      ) {
-                          Column {
-                              Text(
-                                  text = "RAM BOOSTER PRO",
-                                  color = Color.White,
-                                  fontSize = 22.sp,
-                                  fontWeight = FontWeight.ExtraBold
-                              )
-                              Text(
-                                  text = "Hardware: ${ramData.commercialGb} GB (${ramData.totalRealMb} MB reais)",
-                                  color = Color(0xFF94A3B8),
-                                  fontSize = 12.sp
-                              )
-                          }
-                          Surface(
-                              color = if (autoBoosterEnabled) Color(0xFF00E676).copy(alpha = 0.2f) else Color(0xFF1E293B),
-                              shape = RoundedCornerShape(50)
-                          ) {
-                              Text(
-                                  text = if (autoBoosterEnabled) "2º PLANO: ${remainingSeconds}s" else "MANUAL",
-                                  color = if (autoBoosterEnabled) Color(0xFF00E676) else Color(0xFF94A3B8),
-                                  fontSize = 12.sp,
-                                  fontWeight = FontWeight.Bold,
-                                  modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                              )
-                          }
-                      }
+                      Text(text = "RAM BOOSTER CALC EDITION", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                      Text(text = "Hardware: ${ramData.commercialGb} GB (${ramData.totalRealMb} MB)", color = Color(0xFF94A3B8), fontSize = 12.sp)
                   }
 
                   item {
-                      Card(
-                          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                          shape = RoundedCornerShape(20.dp),
-                          modifier = Modifier.fillMaxWidth()
-                      ) {
-                          Column(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .padding(20.dp),
-                              horizontalAlignment = Alignment.CenterHorizontally
-                          ) {
-                              Box(contentAlignment = Alignment.Center) {
-                                  CircularProgressIndicator(
-                                      progress = { usagePercent / 100f },
-                                      modifier = Modifier.size(150.dp),
-                                      strokeWidth = 14.dp,
-                                      color = gaugeColor,
-                                      trackColor = Color(0xFF0B0F19)
-                                  )
-                                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                      Text(
-                                          text = "${usagePercent.roundToInt()}%",
-                                          color = Color.White,
-                                          fontSize = 34.sp,
-                                          fontWeight = FontWeight.ExtraBold
-                                      )
-                                      Text(
-                                          text = "$displayedUsedMb / ${ramData.totalRealMb} MB",
-                                          color = Color(0xFF94A3B8),
-                                          fontSize = 11.sp
-                                      )
-                                  }
-                              }
-
-                              Spacer(modifier = Modifier.height(16.dp))
-
-                              Row(
-                                  modifier = Modifier.fillMaxWidth(),
-                                  horizontalArrangement = Arrangement.SpaceEvenly
-                              ) {
-                                  RamMetricBox("Usada Ativa", "${ramData.usedActiveMb} MB", Color(0xFF38BDF8))
-                                  RamMetricBox("Em Cache", "${ramData.cachedAndBuffersMb} MB", Color(0xFFFBBF24))
-                                  RamMetricBox("Livre Real", "$displayedFreeMb MB", Color(0xFF00E676))
-                              }
-
-                              Spacer(modifier = Modifier.height(14.dp))
-
-                              Row(
-                                  modifier = Modifier
-                                      .fillMaxWidth()
-                                      .clip(RoundedCornerShape(12.dp))
-                                      .background(Color(0xFF0B0F19))
-                                      .padding(horizontal = 12.dp, vertical = 8.dp),
-                                  horizontalArrangement = Arrangement.SpaceBetween,
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
-                                  Column(modifier = Modifier.weight(1f)) {
-                                      Text(
-                                          text = if (showRawCacheAsUsed) "Modo: Somar Cache como Usado" else "Modo: Padrão do Sistema Android",
-                                          color = Color.White,
-                                          fontSize = 12.sp,
-                                          fontWeight = FontWeight.SemiBold
-                                      )
-                                      Text(
-                                          text = if (showRawCacheAsUsed) "Igual a outros apps de limpeza" else "Igual às Configurações do celular",
-                                          color = Color(0xFF94A3B8),
-                                          fontSize = 10.sp
-                                      )
-                                  }
-                                  Switch(
-                                      checked = showRawCacheAsUsed,
-                                      onCheckedChange = { showRawCacheAsUsed = it }
-                                  )
-                              }
-
-                              Spacer(modifier = Modifier.height(14.dp))
-
-                              Text(
-                                  text = statusText,
-                                  color = Color(0xFFCBD5E1),
-                                  fontSize = 12.sp
-                              )
-
-                              Spacer(modifier = Modifier.height(14.dp))
-
-                              Button(
-                                  onClick = {
-                                      scope.launch {
-                                          isOptimizing = true
-                                          BoosterState.setStatus("Limpando processos em segundo plano...")
-                                          val beforeAvail = readRealHardwareRam(context).availRealMb
-                                          val killed = executeRealRamClean(context)
-                                          delay(700L)
-                                          ramData = readRealHardwareRam(context)
-                                          val freed = (ramData.availRealMb - beforeAvail).coerceAtLeast(0L)
-                                          BoosterState.recordCycle(freed, killed)
-                                          isOptimizing = false
+                      Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
+                          Column(modifier = Modifier.fillMaxWidth().padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                              Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceAround) {
+                                  Box(contentAlignment = Alignment.Center) {
+                                      CircularProgressIndicator(progress = { usagePercent / 100f }, modifier = Modifier.size(110.dp), strokeWidth = 12.dp, color = gaugeColor, trackColor = Color(0xFF090D16))
+                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                          Text(text = "${usagePercent.roundToInt()}%", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
+                                          Text(text = "RAM Ativa", color = Color(0xFF94A3B8), fontSize = 10.sp)
                                       }
-                                  },
-                                  enabled = !isOptimizing,
-                                  colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E676)),
-                                  shape = RoundedCornerShape(14.dp),
-                                  modifier = Modifier
-                                      .fillMaxWidth()
-                                      .height(52.dp)
-                              ) {
-                                  Text(
-                                      text = if (isOptimizing) "OTIMIZANDO MEMÓRIA..." else "DEIXAR MAIS RÁPIDO AGORA",
-                                      color = Color(0xFF052E16),
-                                      fontSize = 15.sp,
-                                      fontWeight = FontWeight.ExtraBold
-                                  )
+                                  }
+                                  Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      RamMetricRow("Em Uso Real:", "${ramData.usedActiveMb} MB", Color(0xFF38BDF8))
+                                      RamMetricRow("Livre Agora:", "${ramData.availRealMb} MB", Color(0xFF00E676))
+                                      RamMetricRow("Cache Sistema:", "${ramData.cachedAndBuffersMb} MB", Color(0xFFFBBF24))
+                                  }
                               }
+                              Spacer(modifier = Modifier.height(12.dp))
+                              Text(text = statusText, color = Color(0xFFE2E8F0), fontSize = 12.sp, fontWeight = FontWeight.Medium)
                           }
                       }
                   }
 
+                  // NOVO: CARD BOLHA FLUTUANTE (RAM CALC)
                   item {
-                      Card(
-                          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                          shape = RoundedCornerShape(20.dp),
-                          modifier = Modifier.fillMaxWidth()
-                      ) {
-                          Column(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .padding(18.dp)
-                          ) {
-                              Row(
-                                  modifier = Modifier.fillMaxWidth(),
-                                  horizontalArrangement = Arrangement.SpaceBetween,
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
-                                  Column(modifier = Modifier.weight(1f)) {
-                                      Text(
-                                          text = "Auto Booster em 2º Plano",
-                                          color = Color.White,
-                                          fontSize = 16.sp,
-                                          fontWeight = FontWeight.Bold
-                                      )
-                                      Text(
-                                          text = "Continua limpando com o app minimizado ou tela apagada",
-                                          color = Color(0xFF94A3B8),
-                                          fontSize = 11.sp
-                                      )
-                                  }
-                                  Switch(
-                                      checked = autoBoosterEnabled,
-                                      onCheckedChange = { enable ->
-                                          if (enable) {
-                                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                                  notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                                              } else {
-                                                  toggleForegroundService(context, true)
-                                              }
+                      Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF172036)), shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
+                          Column(modifier = Modifier.fillMaxWidth().padding(18.dp)) {
+                              Text("Modo RAM Calc (Bolha Flutuante)", color = Color(0xFF38BDF8), fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
+                              Spacer(modifier = Modifier.height(4.dp))
+                              Text("Limpe a RAM com 1 toque por cima de jogos e outros aplicativos.", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                              Spacer(modifier = Modifier.height(12.dp))
+                              
+                              Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                  Button(
+                                      onClick = {
+                                          if (!Settings.canDrawOverlays(context)) {
+                                              val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}"))
+                                              context.startActivity(intent)
                                           } else {
-                                              toggleForegroundService(context, false)
+                                              context.startService(Intent(context, FloatingCalcService::class.java))
                                           }
-                                      }
-                                  )
-                              }
-
-                              Spacer(modifier = Modifier.height(12.dp))
-
-                              val presets = listOf(5, 10, 15, 30, 60)
-                              Row(
-                                  modifier = Modifier.fillMaxWidth(),
-                                  horizontalArrangement = Arrangement.spacedBy(8.dp)
-                              ) {
-                                  presets.forEach { sec ->
-                                      val selected = intervalSeconds == sec
-                                      Box(
-                                          modifier = Modifier
-                                              .weight(1f)
-                                              .clip(RoundedCornerShape(10.dp))
-                                              .background(if (selected) Color(0xFF00E676) else Color(0xFF0B0F19))
-                                              .clickable { BoosterState.updateInterval(sec) }
-                                              .padding(vertical = 10.dp),
-                                          contentAlignment = Alignment.Center
-                                      ) {
-                                          Text(
-                                              text = "${sec}s",
-                                              color = if (selected) Color(0xFF052E16) else Color.White,
-                                              fontWeight = FontWeight.Bold,
-                                              fontSize = 13.sp
-                                          )
-                                      }
-                                  }
-                              }
-
-                              Spacer(modifier = Modifier.height(12.dp))
-
-                              Row(
-                                  modifier = Modifier.fillMaxWidth(),
-                                  horizontalArrangement = Arrangement.SpaceBetween,
-                                  verticalAlignment = Alignment.CenterVertically
-                              ) {
-                                  OutlinedButton(onClick = { BoosterState.updateInterval(intervalSeconds - 5) }) {
-                                      Text("- 5s", color = Color.White)
-                                  }
-
-                                  Text(
-                                      text = "Intervalo: $intervalSeconds segundos",
-                                      color = Color.White,
-                                      fontSize = 13.sp,
-                                      fontWeight = FontWeight.SemiBold
-                                  )
-
-                                  OutlinedButton(onClick = { BoosterState.updateInterval(intervalSeconds + 5) }) {
-                                      Text("+ 5s", color = Color.White)
-                                  }
-                              }
-
-                              if (autoBoosterEnabled) {
-                                  Spacer(modifier = Modifier.height(12.dp))
-                                  LinearProgressIndicator(
-                                      progress = { remainingSeconds.toFloat() / intervalSeconds.toFloat() },
-                                      modifier = Modifier
-                                          .fillMaxWidth()
-                                          .height(8.dp)
-                                          .clip(RoundedCornerShape(4.dp)),
-                                      color = Color(0xFF00E676),
-                                      trackColor = Color(0xFF0B0F19)
-                                  )
-                                  Spacer(modifier = Modifier.height(6.dp))
-                                  Row(
-                                      modifier = Modifier.fillMaxWidth(),
-                                      horizontalArrangement = Arrangement.SpaceBetween
+                                      },
+                                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF38BDF8)),
+                                      shape = RoundedCornerShape(12.dp),
+                                      modifier = Modifier.weight(1f).height(46.dp)
                                   ) {
-                                      Text(
-                                          text = "Rodando em 2º plano: ${remainingSeconds}s",
-                                          color = Color(0xFF00E676),
-                                          fontSize = 11.sp,
-                                          fontWeight = FontWeight.Bold
-                                      )
-                                      Text(
-                                          text = "Ciclos: $autoCyclesCount | Total: +$totalFreedAccumulatedMb MB",
-                                          color = Color(0xFF94A3B8),
-                                          fontSize = 11.sp
-                                      )
+                                      Text("ATIVAR BOLHA", color = Color(0xFF082F49), fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                                  }
+                                  
+                                  Button(
+                                      onClick = { context.stopService(Intent(context, FloatingCalcService::class.java)) },
+                                      colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
+                                      shape = RoundedCornerShape(12.dp),
+                                      modifier = Modifier.weight(1f).height(46.dp)
+                                  ) {
+                                      Text("REMOVER BOLHA", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
                                   }
                               }
+                          }
+                      }
+                  }
 
-                              Spacer(modifier = Modifier.height(12.dp))
-
-                              OutlinedButton(
-                                  onClick = { requestIgnoreBatteryOptimizations(context) },
-                                  modifier = Modifier.fillMaxWidth()
-                              ) {
-                                  Text(
-                                      text = "Manter Ativo Sem Restrição de Bateria",
-                                      color = Color(0xFF38BDF8),
-                                      fontSize = 12.sp,
-                                      fontWeight = FontWeight.SemiBold
-                                  )
+                  // HIBERNAÇÃO PROFUNDA (ACESSIBILIDADE)
+                  item {
+                      Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF172036)), shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
+                          Column(modifier = Modifier.fillMaxWidth().padding(18.dp)) {
+                              Text(text = "Hibernação Profunda", color = Color(0xFF00E676), fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+                              Spacer(modifier = Modifier.height(4.dp))
+                              Text(text = if (isAccessibilityOn) "Motor ativo! Fechará os apps selecionados abaixo à força." else "Ative o serviço para clicar em 'Forçar Parada' automaticamente.", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                              Spacer(modifier = Modifier.height(10.dp))
+                              if (!isAccessibilityOn) {
+                                  Button(onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B)), modifier = Modifier.fillMaxWidth().height(48.dp)) {
+                                      Text("ATIVAR ACESSIBILIDADE (1 VEZ)", color = Color(0xFF451A03), fontSize = 13.sp, fontWeight = FontWeight.ExtraBold)
+                                  }
+                              } else {
+                                  Button(onClick = {
+                                      if (selectedPackages.isNotEmpty()) scope.launch { runAutomatedHibernation(context, selectedPackages.toList(), true); ramData = readRealHardwareRam(context) }
+                                  }, enabled = !isHibernating, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00E676)), modifier = Modifier.fillMaxWidth().height(50.dp)) {
+                                      Text(if (isHibernating) "HIBERNANDO..." else "HIBERNAR ${selectedPackages.size} APPS AGORA", color = Color(0xFF052E16), fontSize = 13.sp, fontWeight = FontWeight.ExtraBold)
+                                  }
                               }
                           }
                       }
                   }
 
                   item {
-                      Text(
-                          text = "Apps Instalados (${userApps.size}) - Toque para Forçar Parada",
-                          color = Color.White,
-                          fontSize = 15.sp,
-                          fontWeight = FontWeight.Bold,
-                          modifier = Modifier.padding(top = 4.dp)
-                      )
+                      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                          Text(text = "Apps para Hibernar (${selectedPackages.size}/${userApps.size})", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                          TextButton(onClick = { BoosterState.setSelectedPackages(userApps.map { it.packageName }.toSet()) }) { Text("Todos", color = Color(0xFF38BDF8)) }
+                      }
                   }
 
                   items(userApps) { app ->
-                      Card(
-                          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                          shape = RoundedCornerShape(14.dp),
-                          modifier = Modifier.fillMaxWidth()
-                      ) {
-                          Row(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .padding(horizontal = 14.dp, vertical = 10.dp),
-                              horizontalArrangement = Arrangement.SpaceBetween,
-                              verticalAlignment = Alignment.CenterVertically
-                          ) {
-                              Column(modifier = Modifier.weight(1f)) {
-                                  Text(
-                                      text = app.appName,
-                                      color = Color.White,
-                                      fontSize = 14.sp,
-                                      fontWeight = FontWeight.SemiBold,
-                                      maxLines = 1,
-                                      overflow = TextOverflow.Ellipsis
-                                  )
-                                  Text(
-                                      text = app.packageName,
-                                      color = Color(0xFF64748B),
-                                      fontSize = 11.sp,
-                                      maxLines = 1,
-                                      overflow = TextOverflow.Ellipsis
-                                  )
-                              }
-                              Button(
-                                  onClick = { openAppSettingsToForceStop(context, app.packageName) },
-                                  colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
-                                  contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                              ) {
-                                  Text("Forçar Parada", color = Color.White, fontSize = 11.sp)
+                      val isChecked = selectedPackages.contains(app.packageName)
+                      Card(colors = CardDefaults.cardColors(containerColor = if (isChecked) Color(0xFF1A263D) else MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth().clickable { BoosterState.setSelectedPackages(if (isChecked) selectedPackages - app.packageName else selectedPackages + app.packageName) }) {
+                          Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                              Checkbox(checked = isChecked, onCheckedChange = { c -> BoosterState.setSelectedPackages(if (c) selectedPackages + app.packageName else selectedPackages - app.packageName) })
+                              Column(modifier = Modifier.padding(start = 6.dp)) {
+                                  Text(text = app.appName, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                  Text(text = app.packageName, color = Color(0xFF64748B), fontSize = 11.sp)
                               }
                           }
                       }
@@ -850,53 +796,54 @@ jobs:
           }
 
           @Composable
-          fun RamMetricBox(label: String, value: String, color: Color) {
-              Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                  Text(text = label, color = Color(0xFF94A3B8), fontSize = 11.sp)
-                  Text(text = value, color = color, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+          fun RamMetricRow(label: String, value: String, color: Color) {
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                  Text(text = label, color = Color(0xFF94A3B8), fontSize = 12.sp, modifier = Modifier.width(105.dp))
+                  Text(text = value, color = color, fontSize = 14.sp, fontWeight = FontWeight.Bold)
               }
+          }
+
+          suspend fun runAutomatedHibernation(context: Context, packagesToKill: List<String>, returnToApp: Boolean) {
+              val beforeAvail = readRealHardwareRam(context).availRealMb
+              BoosterState.setHibernating(true)
+              var count = 0
+              for (pkg in packagesToKill) {
+                  count++
+                  BoosterState.stepCompletedForCurrentApp = false
+                  BoosterState.clickedForceStopWaitingDialog = false
+                  BoosterState.setStatus("Hibernando ($count/${packagesToKill.size}): $pkg")
+                  try { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { data = Uri.fromParts("package", pkg, null); addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP) }) } catch (_: Exception) { continue }
+                  var waitedMs = 0
+                  while (!BoosterState.stepCompletedForCurrentApp && waitedMs < 2400) { delay(120L); waitedMs += 120 }
+                  delay(180L)
+              }
+              BoosterState.setHibernating(false)
+              executeDeepRamClean(context)
+              if (returnToApp) {
+                  try { context.startActivity(Intent(context, MainActivity::class.java).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP) }) } catch (_: Exception) {}
+              }
+              delay(400L)
+              val afterAvail = readRealHardwareRam(context).availRealMb
+              BoosterState.recordCycle((afterAvail - beforeAvail).coerceAtLeast(0L), packagesToKill.size)
+          }
+
+          fun isAccessibilityServiceEnabled(context: Context): Boolean {
+              val enabledServices = Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
+              return enabledServices.contains(context.packageName)
           }
 
           fun toggleForegroundService(context: Context, start: Boolean) {
-              val intent = Intent(context, AutoBoosterService::class.java).apply {
-                  action = if (start) AutoBoosterService.ACTION_START else AutoBoosterService.ACTION_STOP
-              }
+              val intent = Intent(context, AutoBoosterService::class.java).apply { action = if (start) AutoBoosterService.ACTION_START else AutoBoosterService.ACTION_STOP }
               if (start) {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      context.startForegroundService(intent)
-                  } else {
-                      context.startService(intent)
-                  }
-              } else {
-                  context.startService(intent)
-              }
-          }
-
-          fun requestIgnoreBatteryOptimizations(context: Context) {
-              try {
-                  val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-                  if (!pm.isIgnoringBatteryOptimizations(context.packageName)) {
-                      val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                          data = Uri.parse("package:${context.packageName}")
-                          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                      }
-                      context.startActivity(intent)
-                  } else {
-                      BoosterState.setStatus("App já está liberado da economia de bateria!")
-                  }
-              } catch (_: Exception) {
-              }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent) else context.startService(intent)
+              } else context.startService(intent)
           }
 
           fun readRealHardwareRam(context: Context): RealHardwareRam {
               val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
               val memInfo = ActivityManager.MemoryInfo()
               am.getMemoryInfo(memInfo)
-
-              var memFreeKb = 0L
-              var buffersKb = 0L
-              var cachedKb = 0L
-
+              var memFreeKb = 0L; var buffersKb = 0L; var cachedKb = 0L
               try {
                   val reader = RandomAccessFile("/proc/meminfo", "r")
                   var line: String?
@@ -904,90 +851,44 @@ jobs:
                       val parts = line!!.trim().split("\\s+".toRegex())
                       if (parts.size >= 2) {
                           val value = parts[1].toLongOrNull() ?: 0L
-                          when (parts[0]) {
-                              "MemFree:" -> memFreeKb = value
-                              "Buffers:" -> buffersKb = value
-                              "Cached:" -> cachedKb = value
-                          }
+                          when (parts[0]) { "MemFree:" -> memFreeKb = value; "Buffers:" -> buffersKb = value; "Cached:" -> cachedKb = value }
                       }
                   }
                   reader.close()
-              } catch (e: Exception) {
-                  e.printStackTrace()
-              }
-
+              } catch (_: Exception) {}
               val totalRealMb = memInfo.totalMem / (1024 * 1024)
               val availRealMb = memInfo.availMem / (1024 * 1024)
               val usedActiveMb = totalRealMb - availRealMb
-
               val freeRawMb = if (memFreeKb > 0) memFreeKb / 1024 else availRealMb / 2
               val cachedMb = if (cachedKb + buffersKb > 0) (cachedKb + buffersKb) / 1024 else (availRealMb - freeRawMb).coerceAtLeast(0L)
               val usedWithCacheMb = (totalRealMb - freeRawMb).coerceIn(usedActiveMb, totalRealMb)
-
-              val commercialGb = when {
-                  totalRealMb > 12500 -> 16
-                  totalRealMb > 8500 -> 12
-                  totalRealMb > 6200 -> 8
-                  totalRealMb > 4200 -> 6
-                  totalRealMb > 2200 -> 4
-                  else -> 2
-              }
-
-              return RealHardwareRam(
-                  commercialGb = commercialGb,
-                  totalRealMb = totalRealMb,
-                  usedActiveMb = usedActiveMb,
-                  availRealMb = availRealMb,
-                  usedWithCacheMb = usedWithCacheMb,
-                  cachedAndBuffersMb = cachedMb,
-                  freeRawMb = freeRawMb
-              )
+              val commercialGb = when { totalRealMb > 12500 -> 16; totalRealMb > 8500 -> 12; totalRealMb > 6200 -> 8; totalRealMb > 4200 -> 6; totalRealMb > 2200 -> 4; else -> 2 }
+              return RealHardwareRam(commercialGb, totalRealMb, usedActiveMb, availRealMb, usedWithCacheMb, cachedMb, freeRawMb)
           }
 
-          suspend fun executeRealRamClean(context: Context): Int = withContext(Dispatchers.IO) {
+          suspend fun executeDeepRamClean(context: Context): Int = withContext(Dispatchers.IO) {
+              try { context.cacheDir?.deleteRecursively(); context.externalCacheDirs?.forEach { it?.deleteRecursively() } } catch (_: Exception) {}
               val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
               val pm = context.packageManager
-              val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
               var count = 0
-
-              for (app in packages) {
-                  val isSystem = (app.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-                  if (!isSystem && app.packageName != context.packageName) {
-                      try {
-                          am.killBackgroundProcesses(app.packageName)
-                          count++
-                      } catch (_: Exception) {
-                      }
+              for (app in pm.getInstalledApplications(PackageManager.GET_META_DATA)) {
+                  if ((app.flags and ApplicationInfo.FLAG_SYSTEM) == 0 && app.packageName != context.packageName) {
+                      try { am.killBackgroundProcesses(app.packageName); count++ } catch (_: Exception) {}
                   }
               }
-              System.gc()
+              Runtime.getRuntime().gc(); System.gc()
               return@withContext count
           }
 
           suspend fun loadUserInstalledApps(context: Context): List<AppProcessItem> = withContext(Dispatchers.IO) {
               val pm = context.packageManager
-              val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
               val result = mutableListOf<AppProcessItem>()
-
-              for (app in apps) {
-                  val isSystem = (app.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-                  if (!isSystem && app.packageName != context.packageName) {
-                      val label = pm.getApplicationLabel(app).toString()
-                      result.add(AppProcessItem(label, app.packageName))
+              for (app in pm.getInstalledApplications(PackageManager.GET_META_DATA)) {
+                  if ((app.flags and ApplicationInfo.FLAG_SYSTEM) == 0 && app.packageName != context.packageName) {
+                      result.add(AppProcessItem(pm.getApplicationLabel(app).toString(), app.packageName, (app.flags and ApplicationInfo.FLAG_STOPPED) == 0))
                   }
               }
-              return@withContext result.sortedBy { it.appName.lowercase() }
-          }
-
-          fun openAppSettingsToForceStop(context: Context, packageName: String) {
-              try {
-                  val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                      data = Uri.fromParts("package", packageName, null)
-                      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                  }
-                  context.startActivity(intent)
-              } catch (_: Exception) {
-              }
+              return@withContext result.sortedWith(compareByDescending<AppProcessItem> { it.isRunningOrHeavy }.thenBy { it.appName.lowercase() })
           }
           EOF
 
@@ -996,16 +897,16 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: 6. Compilar o APK (Debug)
+      - name: 6. Compilar o APK v4.0 RAM Calc (Debug)
         run: |
           export ANDROID_SDK_ROOT=$HOME/android-sdk
           export ANDROID_HOME=$ANDROID_SDK_ROOT
           export PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools
           gradle assembleDebug --stacktrace
-          cp app/build/outputs/apk/debug/app-debug.apk RAM-Booster-Pro.apk
+          cp app/build/outputs/apk/debug/app-debug.apk RAM-Booster-Pro-v4-Calc.apk
 
-      - name: 7. Disponibilizar RAM-Booster-Pro.apk para Download
+      - name: 7. Disponibilizar RAM-Booster-Pro-v4-Calc.apk para Download
         uses: actions/upload-artifact@v4
         with:
-          name: RAM-Booster-Pro-APK
-          path: RAM-Booster-Pro.apk
+          name: RAM-Booster-Pro-v4-Calc-APK
+          path: RAM-Booster-Pro-v4-Calc.apk
